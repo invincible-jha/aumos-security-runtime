@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check src/ tests/
+      - run: ruff format --check src/ tests/
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: aumos
+          POSTGRES_PASSWORD: aumos_dev
+          POSTGRES_DB: aumos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: python -m spacy download en_core_web_sm
+      - run: pytest tests/ -v --cov --cov-report=xml
+        env:
+          AUMOS_DATABASE__URL: postgresql+asyncpg://aumos:aumos_dev@localhost:5432/aumos_test
+          AUMOS_REDIS__URL: redis://localhost:6379/0
+          AUMOS_SECRUNTIME_ENABLE_ML_SCANNER: "true"
+          AUMOS_SECRUNTIME_ENABLE_PII_SCANNER: "true"
+      - uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+
+  latency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]" pytest-benchmark
+      - run: python -m spacy download en_core_web_sm
+      - run: pytest tests/test_latency.py -v --benchmark-json=benchmark.json
+        env:
+          AUMOS_SECRUNTIME_ENABLE_ML_SCANNER: "true"
+          AUMOS_SECRUNTIME_ENABLE_PII_SCANNER: "true"
+      - name: Check P95 latency budget
+        run: |
+          python -c "
+          import json
+          with open('benchmark.json') as f:
+              data = json.load(f)
+          for bench in data['benchmarks']:
+              p95_ms = bench['stats']['q'] * 1000 if 'q' in bench['stats'] else bench['stats']['mean'] * 1000 * 1.5
+              name = bench['name']
+              print(f'{name}: {p95_ms:.1f}ms')
+              if 'scan_input' in name and p95_ms > 50:
+                  raise SystemExit(f'LATENCY BUDGET VIOLATED: {name} P95={p95_ms:.1f}ms > 50ms')
+          print('All latency budgets met.')
+          "
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t test-build .
+
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pip-licenses
+      - run: |
+          pip install -e .
+          pip-licenses --fail-on="GPL;AGPL" --allow-only="MIT;BSD;Apache Software License;ISC;PSF;MPL 2.0"
