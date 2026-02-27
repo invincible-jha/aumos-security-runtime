@@ -6,6 +6,18 @@ Defining interfaces as Protocol classes enables:
   - Clear contracts between scanner adapters and the pipeline service
 
 Services depend on interfaces, not concrete implementations.
+
+Protocols defined:
+- IScannerResult
+- IPatternScanner
+- IMLScanner
+- IPIIScanner
+- ISecurityScanRepository
+- IThreatDetectionRepository
+- IGuardrailRepository
+- ISecurityPolicyRepository
+- ISecretScanner
+- IVulnerabilityScanner
 """
 
 import uuid
@@ -285,6 +297,106 @@ class ISecurityPolicyRepository(Protocol):
         ...
 
 
+@runtime_checkable
+class ISecretScanner(Protocol):
+    """Interface for exposed secret and credential detection.
+
+    Scans LLM inputs and outputs for accidentally exposed API keys, tokens,
+    database connection strings, private keys, and high-entropy strings.
+    Designed for the security pipeline hot path (<5ms target latency).
+    """
+
+    async def scan(self, content: str) -> list[dict[str, Any]]:
+        """Scan content for exposed secrets.
+
+        Returns results in IScannerResult-compatible dict format.
+
+        Args:
+            content: Text content to scan for secrets.
+
+        Returns:
+            List of IScannerResult-compatible dicts, one per finding.
+            Empty list if no secrets are detected.
+        """
+        ...
+
+    async def initialize(self) -> None:
+        """Pre-compile and cache all regex patterns.
+
+        Called once at startup to avoid compilation latency on the hot path.
+        Must be called before scan() is invoked.
+        """
+        ...
+
+    def sanitize_for_logging(self, content: str) -> str:
+        """Sanitize content before logging to prevent secret exposure.
+
+        Args:
+            content: Text content to sanitize.
+
+        Returns:
+            Sanitized content safe for logging.
+        """
+        ...
+
+
+@runtime_checkable
+class IVulnerabilityScanner(Protocol):
+    """Interface for CVE and dependency vulnerability scanning.
+
+    Scans Python package dependencies and container images for known
+    vulnerabilities using pip-audit and Trivy integrations. Not intended
+    for the <50ms request hot path — use for background security jobs.
+    """
+
+    async def scan(self, content: str) -> list[dict[str, Any]]:
+        """Scan for vulnerabilities from a requirements or image reference.
+
+        Content is expected to be a JSON requirements payload or image
+        reference string. Parses the content type and delegates to the
+        appropriate scanner backend.
+
+        Args:
+            content: Requirements JSON or image reference string.
+
+        Returns:
+            List of IScannerResult-compatible dicts, one per CVE finding.
+            Empty list if no vulnerabilities are detected.
+        """
+        ...
+
+    async def scan_python_dependencies(self) -> dict[str, Any]:
+        """Scan installed Python dependencies for known CVEs.
+
+        Uses pip-audit against OSV/PyPA advisory databases.
+
+        Returns:
+            VulnerabilityScanResult-compatible dict with findings.
+        """
+        ...
+
+    async def scan_container_image(self, image_reference: str) -> dict[str, Any]:
+        """Scan a container image for OS and library vulnerabilities.
+
+        Uses Trivy as a subprocess. Not suitable for the request hot path.
+
+        Args:
+            image_reference: Docker image reference (e.g., 'myapp:latest').
+
+        Returns:
+            VulnerabilityScanResult-compatible dict with findings.
+        """
+        ...
+
+    def is_available(self) -> bool:
+        """Return True if at least one scanning backend is available.
+
+        Returns:
+            True if pip-audit or Trivy is installed on the system.
+        """
+        ...
+
+
 __all__ = [
     "IScannerResult",
     "IPatternScanner",
@@ -294,4 +406,6 @@ __all__ = [
     "IThreatDetectionRepository",
     "IGuardrailRepository",
     "ISecurityPolicyRepository",
+    "ISecretScanner",
+    "IVulnerabilityScanner",
 ]

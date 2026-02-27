@@ -31,10 +31,12 @@ from aumos_security_runtime.core.interfaces import (
     IMLScanner,
     IPatternScanner,
     IPIIScanner,
+    ISecretScanner,
     ISecurityPolicyRepository,
     ISecurityScanRepository,
     IScannerResult,
     IThreatDetectionRepository,
+    IVulnerabilityScanner,
 )
 from aumos_security_runtime.core.models import (
     GuardrailRule,
@@ -590,9 +592,227 @@ class ThreatDetectionService:
         )
 
 
+class SecretScanService:
+    """Service for on-demand secret detection in LLM content and log streams.
+
+    Wraps the ISecretScanner adapter with structured logging and
+    suppression rule management. Intended for use both in the pipeline
+    hot path (via SecurityPipelineService) and as a standalone API endpoint
+    for manual content auditing.
+
+    Args:
+        scanner: Injected ISecretScanner implementation.
+    """
+
+    def __init__(self, scanner: ISecretScanner) -> None:
+        """Initialize with injected scanner.
+
+        Args:
+            scanner: Implementation of ISecretScanner.
+        """
+        self._scanner = scanner
+
+    async def scan_content(
+        self,
+        content: str,
+        tenant_id: uuid.UUID,
+    ) -> list[dict[str, Any]]:
+        """Scan arbitrary content for exposed secrets.
+
+        Args:
+            content: Text to scan for credentials and sensitive strings.
+            tenant_id: Requesting tenant (used for audit logging only).
+
+        Returns:
+            List of secret findings in IScannerResult-compatible format.
+        """
+        logger.info(
+            "Running secret scan",
+            tenant_id=str(tenant_id),
+            content_length=len(content),
+        )
+        findings = await self._scanner.scan(content)
+        logger.info(
+            "Secret scan complete",
+            tenant_id=str(tenant_id),
+            n_findings=len(findings),
+        )
+        return findings
+
+    async def sanitize_content(self, content: str) -> str:
+        """Return content with all detected secrets redacted.
+
+        Delegates to the scanner's sanitize_for_logging method which
+        replaces matched secrets with [REDACTED:{entity_type}] markers.
+
+        Args:
+            content: Raw text that may contain secrets.
+
+        Returns:
+            Sanitized text safe for logging or downstream storage.
+        """
+        return self._scanner.sanitize_for_logging(content)
+
+
+class VulnerabilityService:
+    """Service for CVE and dependency vulnerability scanning.
+
+    Orchestrates pip-audit and Trivy scans via the IVulnerabilityScanner
+    adapter. Not suitable for the <50ms request hot path — use for
+    background security jobs triggered by deployment events or CI/CD gates.
+
+    Produces structured VulnerabilityScanResult dicts suitable for
+    security dashboards and compliance reporting.
+
+    Args:
+        scanner: Injected IVulnerabilityScanner implementation.
+    """
+
+    def __init__(self, scanner: IVulnerabilityScanner) -> None:
+        """Initialize with injected scanner.
+
+        Args:
+            scanner: Implementation of IVulnerabilityScanner.
+        """
+        self._scanner = scanner
+
+    async def scan_python_dependencies(
+        self,
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Scan installed Python package dependencies for known CVEs.
+
+        Uses pip-audit against OSV and PyPA advisory databases.
+
+        Args:
+            tenant_id: Requesting tenant (for audit logging).
+
+        Returns:
+            VulnerabilityScanResult-compatible dict with CVE findings.
+        """
+        logger.info(
+            "Starting Python dependency vulnerability scan",
+            tenant_id=str(tenant_id),
+        )
+
+        if not self._scanner.is_available():
+            logger.warning(
+                "No vulnerability scanner backend available",
+                tenant_id=str(tenant_id),
+            )
+            return {
+                "is_threat": False,
+                "threat_type": "none",
+                "severity": "none",
+                "confidence": 0.0,
+                "details": {"error": "No scanning backend available (pip-audit, Trivy)"},
+                "vulnerabilities": [],
+                "n_critical": 0,
+                "n_high": 0,
+                "n_medium": 0,
+                "n_low": 0,
+                "scan_target": "python_deps",
+                "scanner_used": "unavailable",
+            }
+
+        result = await self._scanner.scan_python_dependencies()
+
+        logger.info(
+            "Python dependency scan complete",
+            tenant_id=str(tenant_id),
+            is_threat=result.get("is_threat"),
+            n_critical=result.get("n_critical", 0),
+            n_high=result.get("n_high", 0),
+        )
+        return result
+
+    async def scan_container_image(
+        self,
+        tenant_id: uuid.UUID,
+        image_reference: str,
+    ) -> dict[str, Any]:
+        """Scan a container image for OS and library vulnerabilities.
+
+        Uses Trivy as a subprocess. The image must be accessible from the
+        host where this service runs.
+
+        Args:
+            tenant_id: Requesting tenant (for audit logging).
+            image_reference: Docker image reference (e.g., 'myapp:latest').
+
+        Returns:
+            VulnerabilityScanResult-compatible dict with CVE findings.
+        """
+        logger.info(
+            "Starting container image vulnerability scan",
+            tenant_id=str(tenant_id),
+            image_reference=image_reference,
+        )
+
+        result = await self._scanner.scan_container_image(image_reference)
+
+        logger.info(
+            "Container image scan complete",
+            tenant_id=str(tenant_id),
+            image_reference=image_reference,
+            is_threat=result.get("is_threat"),
+            n_critical=result.get("n_critical", 0),
+            n_high=result.get("n_high", 0),
+        )
+        return result
+
+    async def get_combined_scan(
+        self,
+        tenant_id: uuid.UUID,
+        image_reference: str | None = None,
+    ) -> dict[str, Any]:
+        """Run all available scans and merge results into a single report.
+
+        Runs Python dependency scan always. Adds container scan if an image
+        reference is provided. Merges all findings into a unified report.
+
+        Args:
+            tenant_id: Requesting tenant.
+            image_reference: Optional container image to scan.
+
+        Returns:
+            Merged scan report with all_vulnerabilities, summary counts,
+            and per-scanner sub-results.
+        """
+        dep_result = await self.scan_python_dependencies(tenant_id)
+        all_vulnerabilities: list[dict[str, Any]] = list(dep_result.get("vulnerabilities", []))
+
+        container_result: dict[str, Any] | None = None
+        if image_reference:
+            container_result = await self.scan_container_image(tenant_id, image_reference)
+            all_vulnerabilities.extend(container_result.get("vulnerabilities", []))
+
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
+        severities = [
+            r.get("severity", "none")
+            for r in [dep_result, container_result]
+            if r is not None
+        ]
+        overall_severity = min(severities, key=lambda s: severity_order.get(s, 99)) if severities else "none"
+
+        return {
+            "overall_severity": overall_severity,
+            "is_threat": dep_result.get("is_threat") or (
+                container_result.get("is_threat") if container_result else False
+            ),
+            "all_vulnerabilities": all_vulnerabilities,
+            "total_vulnerabilities": len(all_vulnerabilities),
+            "python_deps_scan": dep_result,
+            "container_scan": container_result,
+            "tenant_id": str(tenant_id),
+        }
+
+
 __all__ = [
     "ScanResult",
     "SecurityPipelineService",
     "GuardrailService",
     "ThreatDetectionService",
+    "SecretScanService",
+    "VulnerabilityService",
 ]
